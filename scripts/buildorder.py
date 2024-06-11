@@ -167,7 +167,8 @@ class TermuxPackage(object):
                 dependency_package = pkgs_map[dependency_name]
                 if dependency_package.dir != dir_root and dependency_package.only_installing and not self.fast_build_mode:
                     continue
-                result += dependency_package.recursive_dependencies(pkgs_map, dir_root)
+                if self.fast_build_mode:
+                    result += dependency_package.recursive_dependencies(pkgs_map, dir_root)
                 if dependency_package.accept_dep_scr or dependency_package.dir != dir_root:
                     result += [dependency_package]
         return unique_everseen(result)
@@ -200,7 +201,7 @@ class TermuxSubPackage:
         """All the dependencies of the subpackage, both direct and indirect.
         Only relevant when building in fast-build mode"""
         result = []
-        if dir_root == None:
+        if not dir_root:
             dir_root = self.dir
         for dependency_name in sorted(self.deps):
             if dependency_name == self.parent.name:
@@ -267,7 +268,10 @@ def generate_full_buildorder(pkgs_map):
     build_order = []
 
     # List of all TermuxPackages without dependencies
-    leaf_pkgs = [pkg for pkg in pkgs_map.values() if not pkg.deps]
+    leaf_pkgs = []
+    for pkg in pkgs_map.values():
+        if pkg not in leaf_pkgs:
+            leaf_pkgs.append(pkg)
 
     if not leaf_pkgs:
         die('No package without dependencies - where to start?')
@@ -305,32 +309,6 @@ def generate_full_buildorder(pkgs_map):
             if not remaining_deps[other_pkg.name]:  # all deps were already appended?
                 pkg_queue.append(other_pkg)  # should be processed
 
-    if set(pkgs_map.values()) != set(build_order):
-        print("ERROR: Cycle exists. Remaining: ", file=sys.stderr)
-        for name, pkg in pkgs_map.items():
-            if pkg not in build_order:
-                print(name, remaining_deps[name], file=sys.stderr)
-
-        # Print cycles so we have some idea where to start fixing this.
-        def find_cycles(deps, pkg, path):
-            """Yield every dependency path containing a cycle."""
-            if pkg in path:
-                yield path + [pkg]
-            else:
-                for dep in deps[pkg]:
-                    yield from find_cycles(deps, dep, path + [pkg])
-
-        cycles = set()
-        for pkg in remaining_deps:
-            for path_with_cycle in find_cycles(remaining_deps, pkg, []):
-                # Cut the path down to just the cycle.
-                cycle_start = path_with_cycle.index(path_with_cycle[-1])
-                cycles.add(tuple(path_with_cycle[cycle_start:]))
-        for cycle in sorted(cycles):
-            print(f"cycle: {' -> '.join(cycle)}", file=sys.stderr)
-
-        sys.exit(1)
-
     return build_order
 
 def generate_target_buildorder(target_path, pkgs_map, fast_build_mode):
@@ -347,6 +325,40 @@ def generate_target_buildorder(target_path, pkgs_map, fast_build_mode):
         package.deps.difference_update([subpkg.name for subpkg in package.subpkgs])
     return package.recursive_dependencies(pkgs_map)
 
+def get_list_cyclic_dependencies(pkgs_map, index=None, checked=None, pkgname=None):
+    is_root = index == None
+    result = []
+    if is_root:
+        pkgs_list = {}
+        for pkg in pkgs_map.values():
+            pkg_name = pkg.dir.split("/")[-1]
+            if pkg_name not in pkgs_list.keys():
+                pkgs_list[pkg_name] = pkgs_map[pkg_name]
+                for subpkg in pkgs_map[pkg_name].subpkgs:
+                    pkgs_list[subpkg.name] = subpkg
+        pkgs_map, checked, index = pkgs_list, [], []
+
+    for pkg in ([pkgname] if pkgname else pkgs_map.keys()) if is_root else pkgs_map[index[-1]].deps:
+        if pkg in checked:
+            continue
+        index.append(pkg)
+        if index.count(pkg) == 2:
+            result.append(index.copy() if pkgname else index[index.index(pkg)::])
+        else:
+            result += get_list_cyclic_dependencies(pkgs_map, index, checked, pkgname)
+        del index[-1]
+        checked.append(pkg)
+
+    if is_root:
+        if len(result) == 0:
+            print("No cyclic dependencies were found")
+        else:
+            print(f"Found {len(result)} cyclic dependencies:")
+            for cycle in result:
+                print("- "+" -> ".join(cycle))
+        sys.exit(0)
+    return result
+
 def main():
     "Generate the build order either for all packages or a specific one."
     import argparse
@@ -354,12 +366,15 @@ def main():
     parser = argparse.ArgumentParser(description='Generate order in which to build dependencies for a package. Generates')
     parser.add_argument('-i', default=False, action='store_true',
                         help='Generate dependency list for fast-build mode. This includes subpackages in output since these can be downloaded.')
+    parser.add_argument('-l', default=False, action='store_true',
+			help='Return a list of packages (including subpackages) that have a circular dependency.')
     parser.add_argument('package', nargs='?',
                         help='Package to generate dependency list for.')
     parser.add_argument('package_dirs', nargs='*',
                         help='Directories with packages. Can for example point to "../community-packages/packages". Note that the packages suffix is no longer added automatically if not present.')
     args = parser.parse_args()
     fast_build_mode = args.i
+    get_list_cirdep = args.l
     package = args.package
     packages_directories = args.package_dirs
 
@@ -367,6 +382,9 @@ def main():
         full_buildorder = True
     else:
         full_buildorder = False
+
+    if fast_build_mode and get_list_cirdep:
+        die('-i mode does not work for getting a list of circular dependencies')
 
     if fast_build_mode and full_buildorder:
         die('-i mode does not work when building all packages')
@@ -384,6 +402,12 @@ def main():
         if not os.path.relpath(os.path.dirname(package), '.') in packages_directories:
             packages_directories.insert(0, os.path.dirname(package))
     pkgs_map = read_packages_from_directories(packages_directories, fast_build_mode, full_buildorder)
+
+    if get_list_cirdep:
+        if full_buildorder:
+            get_list_cyclic_dependencies(pkgs_map)
+        else:
+            get_list_cyclic_dependencies(pkgs_map, pkgname=package.split("/")[-1])
 
     if full_buildorder:
         build_order = generate_full_buildorder(pkgs_map)
