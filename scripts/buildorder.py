@@ -81,8 +81,8 @@ def parse_build_file_excluded_arches(path):
 
     return set(arches)
 
-def parse_build_file_variable_bool(path, var):
-    value = 'false'
+def parse_build_file_variable(path, var):
+    value = None
 
     with open(path, encoding="utf-8") as build_script:
         for line in build_script:
@@ -90,7 +90,10 @@ def parse_build_file_variable_bool(path, var):
                 value = line.split('=')[-1].replace('\n', '')
                 break
 
-    return value == 'true'
+    return value
+
+def parse_build_file_variable_bool(path, var):
+    return parse_build_file_variable(path, var) == 'true'
 
 def add_prefix_glibc_to_pkgname(name):
 	return name.replace("-static", "-glibc-static") if "static" == name.split("-")[-1] else name+"-glibc"
@@ -183,13 +186,18 @@ class TermuxSubPackage:
         if "gpkg" in subpackage_file_path.split("/")[-3].split("-") and "glibc" not in self.name.split("-"):
             self.name = add_prefix_glibc_to_pkgname(self.name)
         self.parent = parent
-        self.deps = set([parent.name])
         self.only_installing = parent.only_installing
         self.accept_dep_scr = parent.accept_dep_scr
+        self.depend_on_parent = parse_build_file_variable(subpackage_file_path, "TERMUX_SUBPKG_DEPEND_ON_PARENT") if not virtual else None
         self.excluded_arches = set()
+        self.deps = set()
         if not virtual:
             self.deps |= parse_build_file_dependencies(subpackage_file_path)
             self.excluded_arches |= parse_build_file_excluded_arches(subpackage_file_path)
+        if not self.depend_on_parent or self.depend_on_parent == "unversioned":
+            self.deps |= set([parent.name])
+        elif self.depend_on_parent == "deps":
+            self.deps |= parent.deps
         self.dir = parent.dir
 
         self.needed_by = set()  # Populated outside constructor, reverse of deps.
@@ -248,10 +256,7 @@ def read_packages_from_directories(directories, fast_build_mode, full_buildmode)
                         continue
                     if subpkg.name in pkgs_map:
                         die('Duplicated package: ' + subpkg.name)
-                    elif fast_build_mode:
-                        pkgs_map[subpkg.name] = subpkg
-                    else:
-                        pkgs_map[subpkg.name] = new_package
+                    pkgs_map[subpkg.name] = subpkg
                     all_packages.append(subpkg)
 
     for pkg in all_packages:
@@ -265,49 +270,35 @@ def read_packages_from_directories(directories, fast_build_mode, full_buildmode)
 
 def generate_full_buildorder(pkgs_map):
     "Generate a build order for building all packages."
-    build_order = []
+    pkgs_sort = [pkg.name for pkg in pkgs_map.values() if not pkg.deps and isinstance(pkg, TermuxPackage)]
 
-    # List of all TermuxPackages without dependencies
-    leaf_pkgs = []
-    for pkg in pkgs_map.values():
-        if pkg not in leaf_pkgs:
-            leaf_pkgs.append(pkg)
-
-    if not leaf_pkgs:
+    if not pkgs_sort:
         die('No package without dependencies - where to start?')
 
-    # Sort alphabetically:
-    pkg_queue = sorted(leaf_pkgs, key=lambda p: p.name)
+    build_order = [pkgs_map[pkg] for pkg in pkgs_sort]
 
-    # Topological sorting
-    visited = set()
+    cyclic_deps_list = get_list_cyclic_dependencies(pkgs_map, return_result=True)
 
-    # Tracks non-visited deps for each package
-    remaining_deps = {}
-    for name, pkg in pkgs_map.items():
-        remaining_deps[name] = set(pkg.deps)
-        for subpkg in pkg.subpkgs:
-            remaining_deps[subpkg.name] = set(subpkg.deps)
-
-    while pkg_queue:
-        pkg = pkg_queue.pop(0)
-        if pkg.name in visited:
-            continue
-
-        # print("Processing {}:".format(pkg.name), pkg.needed_by)
-        visited.add(pkg.name)
-        build_order.append(pkg)
-
-        for other_pkg in sorted(pkg.needed_by, key=lambda p: p.name):
-            # Remove this pkg from deps
-            remaining_deps[other_pkg.name].discard(pkg.name)
-            # ... and all its subpackages
-            remaining_deps[other_pkg.name].difference_update(
-                [subpkg.name for subpkg in pkg.subpkgs]
-            )
-
-            if not remaining_deps[other_pkg.name]:  # all deps were already appended?
-                pkg_queue.append(other_pkg)  # should be processed
+    while len(pkgs_sort) < len(pkgs_map):
+        for pkg in pkgs_map.values():
+            if pkg.name in pkgs_sort:
+                continue
+            is_subpackage = isinstance(pkg, TermuxSubPackage)
+            if is_subpackage and pkg.parent.name not in pkgs_sort:
+                pkg = pkg.parent
+                is_subpackage = False
+            subpkgs = [subpkg.name for subpkg in (pkg.parent.subpkgs if is_subpackage else pkg.subpkgs)]
+            for dep in pkg.deps:
+                for cyclic in cyclic_deps_list:
+                    if pkg.name in cyclic and dep == cyclic[cyclic.index(pkg.name)+1]:
+                        break
+                else:
+                    if dep not in subpkgs and dep not in pkgs_sort:
+                        break
+            else:
+                if not is_subpackage:
+                    build_order.append(pkg)
+                pkgs_sort.append(pkg.name)
 
     return build_order
 
@@ -325,18 +316,11 @@ def generate_target_buildorder(target_path, pkgs_map, fast_build_mode):
         package.deps.difference_update([subpkg.name for subpkg in package.subpkgs])
     return package.recursive_dependencies(pkgs_map)
 
-def get_list_cyclic_dependencies(pkgs_map, index=None, checked=None, pkgname=None):
+def get_list_cyclic_dependencies(pkgs_map, index=None, checked=None, pkgname=None, return_result=False):
     is_root = index == None
-    result = []
     if is_root:
-        pkgs_list = {}
-        for pkg in pkgs_map.values():
-            pkg_name = pkg.dir.split("/")[-1]
-            if pkg_name not in pkgs_list.keys():
-                pkgs_list[pkg_name] = pkgs_map[pkg_name]
-                for subpkg in pkgs_map[pkg_name].subpkgs:
-                    pkgs_list[subpkg.name] = subpkg
-        pkgs_map, checked, index = pkgs_list, [], []
+        checked, index = [], []
+    result = []
 
     for pkg in ([pkgname] if pkgname else pkgs_map.keys()) if is_root else pkgs_map[index[-1]].deps:
         if pkg in checked:
@@ -349,7 +333,7 @@ def get_list_cyclic_dependencies(pkgs_map, index=None, checked=None, pkgname=Non
         del index[-1]
         checked.append(pkg)
 
-    if is_root:
+    if is_root and not return_result:
         if len(result) == 0:
             print("No cyclic dependencies were found")
         else:
@@ -357,6 +341,7 @@ def get_list_cyclic_dependencies(pkgs_map, index=None, checked=None, pkgname=Non
             for cycle in result:
                 print("- "+" -> ".join(cycle))
         sys.exit(0)
+
     return result
 
 def main():
